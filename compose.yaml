@@ -7,5 +7,3 @@ services:
     ports:
       - "47700:47700"   # relay (TCP, game traffic)
       - "47701:47701"   # lobby (HTTP)
-    environment:
-      ROOM_TIMEOUT: 15s

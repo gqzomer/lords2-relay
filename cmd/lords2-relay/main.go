@@ -50,8 +50,6 @@ func main() {
 		}
 	}()
 
-	go lobby.ExpireLoop(ctx, rooms, cfg.RoomTimeout, log)
-
 	<-ctx.Done()
 	log.Info("shutting down")
 

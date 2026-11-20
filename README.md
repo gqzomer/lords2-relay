@@ -47,7 +47,6 @@ Settings (environment variables):
 |---|---|---|
 | `LOBBY_ADDR` | `:47701` | read-only HTTP address (room list, health check) |
 | `RELAY_ADDR` | `:47700` | TCP relay address |
-| `ROOM_TIMEOUT` | `15s` | from the old HTTP design; goes away once rooms live on the control connection |
 
 ## Deploying to DigitalOcean
 
@@ -67,6 +66,6 @@ Settings (environment variables):
 - [ ] Relay: list connections (LIST, ROOMS)
 - [ ] Relay: control connections (HOST, HOSTED, UPDATE, PING/PONG); the room is removed when the connection closes
 - [ ] Relay: joining (JOIN, pair codes, status byte), then `pipe`
-- [ ] HTTP: drop the host routes from `internal/lobby/handler.go`, keep `/v1/rooms` and `/healthz`; drop `ExpireLoop`
+- [x] HTTP: drop the host routes from `internal/lobby/handler.go`, keep `/v1/rooms` and `/healthz`; drop `ExpireLoop`
 - [ ] Limits per IP address (rooms, connections)
 - [ ] Phase 0 on a VPS: a plain TCP forward to measure how a relay feels in a real game

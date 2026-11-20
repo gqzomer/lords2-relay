@@ -2,37 +2,24 @@
 // so the same image runs locally and on the VPS with different settings.
 package config
 
-import (
-	"os"
-	"time"
-)
+import "os"
 
 type Config struct {
-	LobbyAddr   string        // HTTP lobby, e.g. ":47701"
-	RelayAddr   string        // TCP relay, e.g. ":47700"
-	RoomTimeout time.Duration // a room without an update for this long is removed
+	LobbyAddr string // read-only HTTP (room list, health check), e.g. ":47701"
+	RelayAddr string // TCP relay, everything the game does, e.g. ":47700"
 }
 
 func FromEnv() Config {
 	return Config{
-		LobbyAddr:   env("LOBBY_ADDR", ":47701"),
-		RelayAddr:   env("RELAY_ADDR", ":47700"),
-		RoomTimeout: envDuration("ROOM_TIMEOUT", 15*time.Second),
+		LobbyAddr: env("LOBBY_ADDR", ":47701"),
+		RelayAddr: env("RELAY_ADDR", ":47700"),
 	}
 }
 
+// env returns the environment variable key, or def when it is unset or empty.
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
-	}
-	return def
-}
-
-func envDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
 	}
 	return def
 }

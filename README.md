@@ -1,7 +1,8 @@
 # lords2-relay
 
 Lobby and relay server for Lords2HD multiplayer (Lords of the Realm II). Players host and find rooms from inside the game,
-and all game traffic goes through this server, so nobody needs a port forward.
+and all game traffic goes through this server, so nobody needs a port forward. The game talks to it over one TCP port
+(47700); a small read-only HTTP API (47701) shows the room list to people and monitoring.
 
 Status: **skeleton**. It compiles and runs, the room list and the byte-copying part of the relay work, and the rest is
 marked `TODO`.
@@ -44,9 +45,9 @@ Settings (environment variables):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOBBY_ADDR` | `:47701` | HTTP lobby address |
+| `LOBBY_ADDR` | `:47701` | read-only HTTP address (room list, health check) |
 | `RELAY_ADDR` | `:47700` | TCP relay address |
-| `ROOM_TIMEOUT` | `15s` | a room without a host update for this long is removed |
+| `ROOM_TIMEOUT` | `15s` | from the old HTTP design; goes away once rooms live on the control connection |
 
 ## Deploying to DigitalOcean
 
@@ -60,10 +61,12 @@ Settings (environment variables):
 
 ## To do
 
-- [ ] Lobby: `Create`, `Update`, `Remove` in `internal/lobby/registry.go` and their handlers (start from `List`)
-- [ ] Lobby: join endpoint that hands out pair codes
+- [ ] Registry: `Create`, `Update`, `Remove` in `internal/lobby/registry.go` (start from `List`), with tests
 - [ ] Relay: read and check the header (`internal/relay/relay.go`, `handle`)
-- [ ] Relay: control connections, JOIN frames, pairing, then `pipe`
-- [ ] Limits per IP address (rooms, connections, requests)
-- [ ] Tests for the registry and the HTTP API
+- [ ] Relay: frame reading and writing (`len`, `type`, `payload`)
+- [ ] Relay: list connections (LIST, ROOMS)
+- [ ] Relay: control connections (HOST, HOSTED, UPDATE, PING/PONG); the room is removed when the connection closes
+- [ ] Relay: joining (JOIN, pair codes, status byte), then `pipe`
+- [ ] HTTP: drop the host routes from `internal/lobby/handler.go`, keep `/v1/rooms` and `/healthz`; drop `ExpireLoop`
+- [ ] Limits per IP address (rooms, connections)
 - [ ] Phase 0 on a VPS: a plain TCP forward to measure how a relay feels in a real game

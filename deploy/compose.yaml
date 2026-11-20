@@ -1,0 +1,15 @@
+# On the VPS: runs the image built by GitHub Actions. Placed in /opt/lords2-relay by cloud-init.
+services:
+  relay:
+    image: ghcr.io/gqzomer/lords2-relay:latest
+    restart: unless-stopped
+    ports:
+      - "47700:47700"   # relay (TCP, game traffic)
+      - "47701:47701"   # lobby (HTTP)
+    environment:
+      ROOM_TIMEOUT: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"   # keep logs small: 5 files of 10 MB, oldest deleted first
+        max-file: "5"

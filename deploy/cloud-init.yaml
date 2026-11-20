@@ -1,0 +1,13 @@
+#cloud-config
+# Paste into "User data" when creating a DigitalOcean Droplet from the Docker Marketplace image.
+# The Droplet comes up with the relay running.
+package_update: true
+packages:
+  - unattended-upgrades   # automatic security updates
+
+runcmd:
+  - mkdir -p /opt/lords2-relay
+  - curl -fsSL -o /opt/lords2-relay/compose.yaml https://raw.githubusercontent.com/gqzomer/lords2-relay/main/deploy/compose.yaml
+  - curl -fsSL -o /opt/lords2-relay/update.sh https://raw.githubusercontent.com/gqzomer/lords2-relay/main/deploy/update.sh
+  - chmod +x /opt/lords2-relay/update.sh
+  - cd /opt/lords2-relay && docker compose up -d

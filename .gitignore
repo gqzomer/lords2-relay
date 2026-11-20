@@ -1,0 +1,8 @@
+# Build output
+/lords2-relay
+/bin/
+*.exe
+
+# Editors
+.vscode/
+.idea/

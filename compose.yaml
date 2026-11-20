@@ -1,0 +1,11 @@
+# Local development: builds the image from this folder.
+#   docker compose up --build        (or: podman compose up --build)
+# The lobby is then on http://localhost:47701, the relay on localhost:47700.
+services:
+  relay:
+    build: .
+    ports:
+      - "47700:47700"   # relay (TCP, game traffic)
+      - "47701:47701"   # lobby (HTTP)
+    environment:
+      ROOM_TIMEOUT: 15s

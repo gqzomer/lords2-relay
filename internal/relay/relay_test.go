@@ -28,6 +28,16 @@ func tcpPair(t *testing.T) (client, server net.Conn) {
 	return client, <-accepted
 }
 
+// TODO: tests for handle, one per step as it gets written. Start a Server on "127.0.0.1:0" (or call s.handle on the
+// server side of tcpPair) and act as the client:
+//   - header: wrong magic, wrong version (expect error 1), unknown role, too short -> connection closed
+//   - frames: readFrame/writeFrame round trip; len 0 and len > 1024 rejected
+//   - list: LIST -> ROOMS with the rooms from the registry, oldest first, at most 20
+//   - control: HOST -> HOSTED and the room is in the registry; bad HOST -> ERROR 2; UPDATE changes the room;
+//     closing the connection removes the room
+//   - joining: joiner gets status 0 and the bytes reach the host; unknown room -> 3; locked or full room -> 4;
+//     host never connects -> 5; a pair_code works only once
+
 // The relay's pipe must pass bytes both ways, unchanged.
 func TestPipe(t *testing.T) {
 	host, hostSide := tcpPair(t)

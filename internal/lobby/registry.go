@@ -5,10 +5,13 @@
 package lobby
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Limits from docs/protocol.md.
@@ -23,8 +26,6 @@ const (
 var (
 	ErrBadRequest = errors.New("bad request")
 	ErrNoRoom     = errors.New("no such room")
-
-	errNotImplemented = errors.New("not implemented yet") // delete once every method is written
 )
 
 // Room is one open game. The json tags name the fields in the HTTP room list.
@@ -65,28 +66,69 @@ func (r *Registry) List(proto uint32) []Room {
 }
 
 // Create adds a room for a new host and returns a copy of it.
-//
-// TODO (exercise):
-//   - name must be 1..MaxNameLen bytes and valid UTF-8 (package unicode/utf8), else ErrBadRequest
-//   - maxPlayers must be MinPlayers..MaxPlayers, else ErrBadRequest
-//   - the new room has 1 player (the host), is not locked, and Created is now
-//   - its ID is a random uint32 from crypto/rand: never 0, and not already in use
-func (r *Registry) Create(name string, maxPlayers int, proto uint32) (Room, error) {
-	return Room{}, errNotImplemented
+func (r *Registry) Create(name string, roomSize int, proto uint32) (Room, error) {
+	
+	if len(name) == 0 || len(name) > MaxNameLen || !utf8.ValidString(name) {
+		return Room{}, ErrBadRequest
+	}
+	
+	if roomSize < MinPlayers || roomSize > MaxPlayers {
+		return Room{}, ErrBadRequest
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var id uint32
+
+	for id == 0 || r.rooms[id] != nil {
+		var b [4]byte
+		rand.Read(b[:])
+		id = binary.LittleEndian.Uint32(b[:])
+	}
+
+	room := &Room{
+		ID: id,
+		Name: name,
+		Players: 1,
+		MaxPlayers: roomSize,
+		Proto: proto,
+		Locked: false,
+		Created: time.Now(),
+	}
+
+	r.rooms[id] = room
+	
+	return *room, nil
 }
 
 // Update sets the player count and the locked flag of a room.
-//
-// TODO (exercise):
-//   - unknown id: ErrNoRoom
-//   - players must be 1..the room's MaxPlayers, else ErrBadRequest (and the room stays unchanged)
 func (r *Registry) Update(id uint32, players int, locked bool) error {
-	return errNotImplemented
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	room := r.rooms[id]
+	
+	if room == nil {
+		return ErrNoRoom
+	}
+
+	if players > room.MaxPlayers || players < 1 {
+		return ErrBadRequest
+	}
+
+
+	room.Locked = locked
+	room.Players = players
+
+	return nil
 }
 
 // Remove deletes a room. Removing a room that is already gone is fine: the relay calls this
 // whenever a control connection closes, without checking first.
-//
-// TODO (exercise): one line plus the locking.
 func (r *Registry) Remove(id uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.rooms, id)
 }

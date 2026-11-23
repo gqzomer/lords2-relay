@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/gqzomer/lords2-relay/internal/lobby"
@@ -43,17 +44,24 @@ const (
 	ROOMS  = 9
 )
 
+const (
+	ErrCodeVersion    = 1
+	ErrCodeBadRequest = 2
+	ErrCodeNoRoom     = 3
+	ErrCodeRoomClosed = 4
+	ErrCodeTimeout    = 5
+	ErrCodeServerFull = 6
+)
+
+const (
+	PingInterval = 15 * time.Second
+	PongTimeout  = 15 * time.Second
+)
+
 // TODO: more constants from docs/protocol.md, so the code has no bare numbers:
-//   - the header: magic "L2RL", version 1, header size 6, pair_code size 16
-//   - frame types: HOST 1, HOSTED 2, UPDATE 3, JOIN 4, PING 5, PONG 6, ERROR 7, LIST 8, ROOMS 9
-//   - error codes (ERROR frames and the status byte): 0 OK .. 6 server full
 //   - timings: 10 s for the header, PING every 15 s, 15 s to answer a PING, a pair_code lives 10 s
-//   - limits: frame len at most 1024, at most 20 rooms in ROOMS
 
 // TODO: frame helpers, used by control (role 1) and list (role 4) connections:
-//   - readFrame(conn) (typ byte, payload []byte, err error): read the u16 len (little-endian) with io.ReadFull,
-//     reject len 0 or len > 1024, then read len bytes: the first is the type, the rest the payload
-//   - writeFrame(conn, typ, payload): the same in reverse
 //   - small helpers for the payload types: u8, u16, u32 (little-endian) and str (u8 length + UTF-8 bytes)
 
 func readFrame(conn net.Conn) (typ byte, payload []byte, err error) {
@@ -81,7 +89,22 @@ func readFrame(conn net.Conn) (typ byte, payload []byte, err error) {
 	return payload[0], payload[1:], nil
 }
 
-func writeFrame(conn net.Conn) {}
+func writeFrame(conn net.Conn, typ byte, payload []byte) error {
+	if 1+len(payload) > MaxFrameLength {
+		return errors.New("payload too large")
+	}
+
+	total := 3 + len(payload) // 2 length bytes + 1 type byte + payload
+
+	b := make([]byte, 0, total)
+
+	b = binary.LittleEndian.AppendUint16(b, uint16(1+len(payload)))
+	b = append(b, typ)
+	b = append(b, payload...)
+
+	_, err := conn.Write(b)
+	return err
+}
 
 type Server struct {
 	addr  string
@@ -180,9 +203,157 @@ func (s *Server) handle(conn net.Conn) {
 }
 
 func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
+	typ, payload, err := readFrame(conn)
+
+	if err != nil {
+		log.Warn("failed to read frame", "reason", err)
+		return
+	}
+
+	if typ != LIST || len(payload) != 0 {
+		log.Warn("failed to read frame", "reason", "unexpected type or payload")
+		return
+	}
+
+	rooms := s.rooms.List(0)
+
+	if len(rooms) > MaxRooms {
+		rooms = rooms[:MaxRooms]
+	}
+
+	b := make([]byte, 0, 1+len(rooms)*44) // a room takes at most 44 bytes
+	b = append(b, byte(len(rooms)))
+	for _, room := range rooms {
+		var locked byte
+		if room.Locked {
+			locked = 1
+		}
+
+		b = binary.LittleEndian.AppendUint32(b, room.ID)
+		b = binary.LittleEndian.AppendUint32(b, room.Proto)
+		b = append(b, byte(room.Players))
+		b = append(b, byte(room.MaxPlayers))
+		b = append(b, locked)
+		b = append(b, byte(len(room.Name)))
+		b = append(b, room.Name...)
+	}
+
+	err = writeFrame(conn, ROOMS, b)
+
+	if err != nil {
+		log.Warn("failed to write frame", "reason", err)
+	}
 }
 
 func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
+	typ, payload, err := readFrame(conn)
+
+	if err != nil {
+		log.Warn("failed to read frame", "reason", err)
+		return
+	}
+
+	if typ != HOST || len(payload) < 6 {
+		log.Warn("failed to read frame", "reason", "unexpected type or payload")
+		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
+		return
+	}
+
+	n := int(payload[5])
+
+	if len(payload) != 6+n {
+		log.Warn("failed to read frame", "reason", "unexpected payload size", "value", len(payload))
+		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
+		return
+	}
+
+	proto := binary.LittleEndian.Uint32(payload[:4])
+	roomSize := int(payload[4])
+	name := string(payload[6 : 6+n])
+
+	room, err := s.rooms.Create(name, roomSize, proto)
+
+	if err != nil {
+		log.Warn("failed to create a room", "reason", err)
+		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
+		return
+	}
+
+	defer s.rooms.Remove(room.ID)
+
+	err = writeFrame(conn, HOSTED, binary.LittleEndian.AppendUint32(nil, room.ID))
+
+	if err != nil {
+		log.Warn("failed to create a room", "reason", err)
+		return
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(PingInterval + PongTimeout))
+
+	log.Info("room created", "id", room.ID, "name", name)
+
+	// From here on two goroutines write to conn (this one and the PING goroutine),
+	// so every write goes through send, which lets only one write at a time.
+	var writeMu sync.Mutex
+	send := func(typ byte, payload []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return writeFrame(conn, typ, payload)
+	}
+
+	// The PING goroutine. close(done) stops it when handleControl returns.
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		ticker := time.NewTicker(PingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := send(PING, nil); err != nil {
+					conn.Close() // wakes up readFrame below, so handleControl returns
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	for {
+		typ, payload, err := readFrame(conn)
+		if err != nil {
+			log.Info("host disconnected", "reason", err)
+			return
+		}
+
+		switch typ {
+		case UPDATE:
+			if len(payload) != 2 || payload[1] > 1 {
+				log.Warn("bad UPDATE payload", "payload", payload)
+				_ = send(ERROR, []byte{ErrCodeBadRequest})
+				return
+			}
+
+			err := s.rooms.Update(room.ID, int(payload[0]), payload[1] == 1)
+
+			if err != nil {
+				log.Warn("failed to update room", "reason", err)
+				_ = send(ERROR, []byte{ErrCodeBadRequest})
+				return
+			}
+
+		case PONG:
+			// The host is alive: give it until the next PING plus PongTimeout.
+			_ = conn.SetReadDeadline(time.Now().Add(PingInterval + PongTimeout))
+
+		default:
+			log.Warn("unexpected frame type", "type", typ)
+			_ = send(ERROR, []byte{ErrCodeBadRequest})
+			return
+		}
+	}
 }
 
 func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {

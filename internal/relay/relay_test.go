@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"bytes"
+	"encoding/binary"
 	"io"
 	"net"
 	"testing"
@@ -37,6 +39,66 @@ func tcpPair(t *testing.T) (client, server net.Conn) {
 //     closing the connection removes the room
 //   - joining: joiner gets status 0 and the bytes reach the host; unknown room -> 3; locked or full room -> 4;
 //     host never connects -> 5; a pair_code works only once
+
+// A frame written with writeFrame must come back unchanged from readFrame.
+func TestFrameRoundTrip(t *testing.T) {
+	client, server := tcpPair(t)
+	defer client.Close()
+	defer server.Close()
+
+	tests := []struct {
+		name    string
+		typ     byte
+		payload []byte
+	}{
+		{"empty payload", LIST, nil},
+		{"small payload", UPDATE, []byte{1, 2, 3}},
+		{"largest payload", ROOMS, bytes.Repeat([]byte{0xAB}, MaxFrameLength-1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := writeFrame(client, tc.typ, tc.payload); err != nil {
+				t.Fatal(err)
+			}
+			_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+			typ, payload, err := readFrame(server)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if typ != tc.typ {
+				t.Errorf("type: got %d, want %d", typ, tc.typ)
+			}
+			if !bytes.Equal(payload, tc.payload) {
+				t.Errorf("payload: got % x, want % x", payload, tc.payload)
+			}
+		})
+	}
+}
+
+// writeFrame must refuse a payload that would make len larger than MaxFrameLength.
+func TestWriteFrameTooLarge(t *testing.T) {
+	client, server := tcpPair(t)
+	defer client.Close()
+	defer server.Close()
+
+	if err := writeFrame(client, ROOMS, make([]byte, MaxFrameLength)); err == nil {
+		t.Fatal("expected an error for a payload of MaxFrameLength bytes")
+	}
+}
+
+// readFrame must reject len 0 and len > MaxFrameLength.
+func TestReadFrameBadLength(t *testing.T) {
+	for _, n := range []uint16{0, MaxFrameLength + 1} {
+		client, server := tcpPair(t)
+		_, _ = client.Write(binary.LittleEndian.AppendUint16(nil, n))
+		_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, _, err := readFrame(server); err == nil {
+			t.Errorf("len %d: expected an error", n)
+		}
+		client.Close()
+		server.Close()
+	}
+}
 
 // The relay's pipe must pass bytes both ways, unchanged.
 func TestPipe(t *testing.T) {

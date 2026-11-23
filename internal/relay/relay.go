@@ -106,20 +106,45 @@ func writeFrame(conn net.Conn, typ byte, payload []byte) error {
 	return err
 }
 
-type Server struct {
-	addr  string
-	rooms *lobby.Registry
-	log   *slog.Logger
+// hostConn is a room's control connection. Several goroutines write to it
+// (the PING goroutine, handleControl itself, and joiners sending JOIN),
+// so every write goes through send.
+type hostConn struct {
+	conn net.Conn
+	mu   sync.Mutex
+}
 
-	// TODO: the state that links connections together, behind its own sync.Mutex (many handle goroutines use it):
-	//   - room id -> that room's control connection, so a joiner's request can send JOIN to the right host
-	//   - pair_code -> the waiting joiner's connection (or a channel to hand it the host's data connection),
-	//     removed after 10 s or once used, since a pair_code is valid for one pairing only
+func (h *hostConn) send(typ byte, payload []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return writeFrame(h.conn, typ, payload)
+}
+
+// waitingJoiner is a joiner whose host has not connected its data connection yet.
+type waitingJoiner struct {
+	conn net.Conn
+	done chan struct{} // closed once the game connection has ended
+}
+
+type Server struct {
+	addr    string
+	rooms   *lobby.Registry
+	log     *slog.Logger
+	mu      sync.Mutex                  // guards hosts and waiting
+	hosts   map[uint32]*hostConn        // room id -> control connection
+	waiting map[[16]byte]*waitingJoiner // pair_code -> joiner
+
 	// TODO (later): connection counts per IP address, to answer error 6 (server full / too many connections)
 }
 
 func New(addr string, rooms *lobby.Registry, log *slog.Logger) *Server {
-	return &Server{addr: addr, rooms: rooms, log: log}
+	return &Server{
+		addr:    addr,
+		rooms:   rooms,
+		log:     log,
+		hosts:   make(map[uint32]*hostConn),
+		waiting: make(map[[16]byte]*waitingJoiner),
+	}
 }
 
 // ListenAndServe accepts connections until ctx is cancelled.
@@ -281,6 +306,18 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 
 	defer s.rooms.Remove(room.ID)
 
+	hc := &hostConn{conn: conn}
+
+	s.mu.Lock()
+	s.hosts[room.ID] = hc
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.hosts, room.ID)
+		s.mu.Unlock()
+	}()
+
 	err = writeFrame(conn, HOSTED, binary.LittleEndian.AppendUint32(nil, room.ID))
 
 	if err != nil {
@@ -292,15 +329,6 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 
 	log.Info("room created", "id", room.ID, "name", name)
 
-	// From here on two goroutines write to conn (this one and the PING goroutine),
-	// so every write goes through send, which lets only one write at a time.
-	var writeMu sync.Mutex
-	send := func(typ byte, payload []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		return writeFrame(conn, typ, payload)
-	}
-
 	// The PING goroutine. close(done) stops it when handleControl returns.
 	done := make(chan struct{})
 	defer close(done)
@@ -311,7 +339,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := send(PING, nil); err != nil {
+				if err := hc.send(PING, nil); err != nil {
 					conn.Close() // wakes up readFrame below, so handleControl returns
 					return
 				}
@@ -332,7 +360,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 		case UPDATE:
 			if len(payload) != 2 || payload[1] > 1 {
 				log.Warn("bad UPDATE payload", "payload", payload)
-				_ = send(ERROR, []byte{ErrCodeBadRequest})
+				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 				return
 			}
 
@@ -340,7 +368,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 
 			if err != nil {
 				log.Warn("failed to update room", "reason", err)
-				_ = send(ERROR, []byte{ErrCodeBadRequest})
+				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 				return
 			}
 
@@ -350,7 +378,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 
 		default:
 			log.Warn("unexpected frame type", "type", typ)
-			_ = send(ERROR, []byte{ErrCodeBadRequest})
+			_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 			return
 		}
 	}

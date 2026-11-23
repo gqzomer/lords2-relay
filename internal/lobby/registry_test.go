@@ -137,6 +137,38 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestGet(t *testing.T) {
+	r := NewRegistry()
+	room := mustCreate(t, r, "game", 4, 7)
+	if err := r.Update(room.ID, 2, true); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := r.Get(room.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ID != room.ID || got.Name != "game" || got.MaxPlayers != 4 || got.Proto != 7 ||
+		got.Players != 2 || !got.Locked {
+		t.Errorf("Get = %+v, want the room with players 2 and locked", got)
+	}
+
+	// Get hands out a copy, like List: changing it must not change the registry.
+	got.Players = 4
+	if again, _ := r.Get(room.ID); again.Players != 2 {
+		t.Errorf("changing Get's result changed the registry: players = %d", again.Players)
+	}
+
+	if _, err := r.Get(room.ID + 1); !errors.Is(err, ErrNoRoom) {
+		t.Errorf("Get of an unknown room: error = %v, want ErrNoRoom", err)
+	}
+
+	r.Remove(room.ID)
+	if _, err := r.Get(room.ID); !errors.Is(err, ErrNoRoom) {
+		t.Errorf("Get after Remove: error = %v, want ErrNoRoom", err)
+	}
+}
+
 func TestListFiltersAndSorts(t *testing.T) {
 	r := NewRegistry()
 	first := mustCreate(t, r, "first", 2, 100)

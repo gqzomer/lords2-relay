@@ -67,11 +67,11 @@ func (r *Registry) List(proto uint32) []Room {
 
 // Create adds a room for a new host and returns a copy of it.
 func (r *Registry) Create(name string, roomSize int, proto uint32) (Room, error) {
-	
+
 	if len(name) == 0 || len(name) > MaxNameLen || !utf8.ValidString(name) {
 		return Room{}, ErrBadRequest
 	}
-	
+
 	if roomSize < MinPlayers || roomSize > MaxPlayers {
 		return Room{}, ErrBadRequest
 	}
@@ -88,17 +88,17 @@ func (r *Registry) Create(name string, roomSize int, proto uint32) (Room, error)
 	}
 
 	room := &Room{
-		ID: id,
-		Name: name,
-		Players: 1,
+		ID:         id,
+		Name:       name,
+		Players:    1,
 		MaxPlayers: roomSize,
-		Proto: proto,
-		Locked: false,
-		Created: time.Now(),
+		Proto:      proto,
+		Locked:     false,
+		Created:    time.Now(),
 	}
 
 	r.rooms[id] = room
-	
+
 	return *room, nil
 }
 
@@ -108,7 +108,7 @@ func (r *Registry) Update(id uint32, players int, locked bool) error {
 	defer r.mu.Unlock()
 
 	room := r.rooms[id]
-	
+
 	if room == nil {
 		return ErrNoRoom
 	}
@@ -116,7 +116,6 @@ func (r *Registry) Update(id uint32, players int, locked bool) error {
 	if players > room.MaxPlayers || players < 1 {
 		return ErrBadRequest
 	}
-
 
 	room.Locked = locked
 	room.Players = players
@@ -136,3 +135,15 @@ func (r *Registry) Remove(id uint32) {
 // TODO (exercise): Get(id uint32) (Room, error) returns a copy of one room, or ErrNoRoom.
 // The relay needs it when a joiner asks for a room: the room must exist, not be locked and not be full
 // (Players < MaxPlayers), else the joiner gets error 3 or 4. Same lock-then-work pattern; add a test.
+func (r *Registry) Get(id uint32) (Room, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	room := r.rooms[id]
+
+	if room == nil {
+		return Room{}, ErrNoRoom
+	}
+
+	return *room, nil
+}

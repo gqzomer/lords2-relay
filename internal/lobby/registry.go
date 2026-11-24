@@ -132,9 +132,7 @@ func (r *Registry) Remove(id uint32) {
 	delete(r.rooms, id)
 }
 
-// TODO (exercise): Get(id uint32) (Room, error) returns a copy of one room, or ErrNoRoom.
-// The relay needs it when a joiner asks for a room: the room must exist, not be locked and not be full
-// (Players < MaxPlayers), else the joiner gets error 3 or 4. Same lock-then-work pattern; add a test.
+// Get returns a copy of one room, or ErrNoRoom.
 func (r *Registry) Get(id uint32) (Room, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

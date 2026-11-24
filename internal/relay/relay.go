@@ -57,17 +57,12 @@ const (
 )
 
 const (
-	PingInterval = 15 * time.Second
-	PongTimeout  = 15 * time.Second
-	PairCodeSize = 16
-	PairTimeout  = 10 * time.Second
+	HeaderTimeout = 10 * time.Second // to send the header and its role-specific part
+	PingInterval  = 15 * time.Second
+	PongTimeout   = 15 * time.Second
+	PairCodeSize  = 16
+	PairTimeout   = 10 * time.Second
 )
-
-// TODO: more constants from docs/protocol.md, so the code has no bare numbers:
-//   - timings: 10 s for the header, PING every 15 s, 15 s to answer a PING, a pair_code lives 10 s
-
-// TODO: frame helpers, used by control (role 1) and list (role 4) connections:
-//   - small helpers for the payload types: u8, u16, u32 (little-endian) and str (u8 length + UTF-8 bytes)
 
 func readFrame(conn net.Conn) (typ byte, payload []byte, err error) {
 
@@ -103,8 +98,8 @@ func writeFrame(conn net.Conn, typ byte, payload []byte) error {
 
 	b := make([]byte, 0, total)
 
-	b = binary.LittleEndian.AppendUint16(b, uint16(1+len(payload)))
-	b = append(b, typ)
+	b = appendU16(b, uint16(1+len(payload)))
+	b = appendU8(b, typ)
 	b = append(b, payload...)
 
 	_, err := conn.Write(b)
@@ -181,7 +176,7 @@ func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 
 	// A client gets a few seconds to send its header, so idle sockets cannot pile up.
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(HeaderTimeout))
 
 	var buf [HeaderSize]byte // 6 empty bytes: [0 0 0 0 0 0]
 	_, err := io.ReadFull(conn, buf[:])
@@ -225,18 +220,6 @@ func (s *Server) handle(conn net.Conn) {
 		log.Warn("bad header", "reason", "invalid role", "got", bufRole)
 		return
 	}
-
-	// TODO (docs/protocol.md has the details for each step):
-	//   3. RoleList (4): read one LIST frame, answer one ROOMS frame (rooms.List(0), oldest first, at most 20), close.
-	//   4. RoleControl (1): the first frame must be HOST: rooms.Create, answer HOSTED or ERROR. Then loop over frames:
-	//      UPDATE -> rooms.Update, PONG -> note the time. Send PING every 15 s; no PONG within 15 s: close.
-	//      When the connection closes, for any reason: rooms.Remove (a defer is a good fit).
-	//   5. RoleJoinerData (3): read room_id (u32). Check the room exists, is not locked, is not full. Make a random
-	//      16-byte pair_code (crypto/rand), send JOIN on the host's control connection, wait up to 10 s for the host.
-	//   6. RoleHostData (2): read pair_code (16 bytes), find the waiting joiner, send status byte 0 to both, then
-	//      pipe(hostConn, joinerConn). On failure send the non-zero error code as the status byte, then close.
-	//   7. Clear the deadline (conn.SetReadDeadline(time.Time{})) once the header is read: control connections live
-	//      for the whole game and piped game traffic must never time out.
 }
 
 func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
@@ -266,13 +249,12 @@ func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
 			locked = 1
 		}
 
-		b = binary.LittleEndian.AppendUint32(b, room.ID)
-		b = binary.LittleEndian.AppendUint32(b, room.Proto)
-		b = append(b, byte(room.Players))
-		b = append(b, byte(room.MaxPlayers))
-		b = append(b, locked)
-		b = append(b, byte(len(room.Name)))
-		b = append(b, room.Name...)
+		b = appendU32(b, room.ID)
+		b = appendU32(b, room.Proto)
+		b = appendU8(b, uint8(room.Players))
+		b = appendU8(b, uint8(room.MaxPlayers))
+		b = appendU8(b, locked)
+		b = appendStr(b, room.Name)
 	}
 
 	err = writeFrame(conn, ROOMS, b)
@@ -290,25 +272,24 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 		return
 	}
 
-	if typ != HOST || len(payload) < 6 {
-		log.Warn("failed to read frame", "reason", "unexpected type or payload")
+	if typ != HOST {
+		log.Warn("failed to read frame", "reason", "first frame is not HOST", "type", typ)
 		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
 		return
 	}
 
-	n := int(payload[5])
+	r := payloadReader{b: payload}
+	proto := r.u32()
+	roomSize := r.u8()
+	name := r.str()
 
-	if len(payload) != 6+n {
-		log.Warn("failed to read frame", "reason", "unexpected payload size", "value", len(payload))
+	if err := r.done(); err != nil {
+		log.Warn("bad HOST payload", "payload", payload)
 		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
 		return
 	}
 
-	proto := binary.LittleEndian.Uint32(payload[:4])
-	roomSize := int(payload[4])
-	name := string(payload[6 : 6+n])
-
-	room, err := s.rooms.Create(name, roomSize, proto)
+	room, err := s.rooms.Create(name, int(roomSize), proto)
 
 	if err != nil {
 		log.Warn("failed to create a room", "reason", err)
@@ -330,7 +311,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 		s.mu.Unlock()
 	}()
 
-	err = writeFrame(conn, HOSTED, binary.LittleEndian.AppendUint32(nil, room.ID))
+	err = writeFrame(conn, HOSTED, appendU32(nil, room.ID))
 
 	if err != nil {
 		log.Warn("failed to create a room", "reason", err)
@@ -370,13 +351,17 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 
 		switch typ {
 		case UPDATE:
-			if len(payload) != 2 || payload[1] > 1 {
+			r := payloadReader{b: payload}
+			players := r.u8()
+			locked := r.u8()
+
+			if err := r.done(); err != nil || locked > 1 {
 				log.Warn("bad UPDATE payload", "payload", payload)
 				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 				return
 			}
 
-			err := s.rooms.Update(room.ID, int(payload[0]), payload[1] == 1)
+			err := s.rooms.Update(room.ID, int(players), locked == 1)
 
 			if err != nil {
 				log.Warn("failed to update room", "reason", err)

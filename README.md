@@ -4,8 +4,9 @@ Lobby and relay server for Lords2HD multiplayer (Lords of the Realm II). Players
 and all game traffic goes through this server, so nobody needs a port forward. The game talks to it over one TCP port
 (47700); a small read-only HTTP API (47701) shows the room list to people and monitoring.
 
-Status: **skeleton**. It compiles and runs, the room list and the byte-copying part of the relay work, and the rest is
-marked `TODO`.
+Status: **working, not yet tested with the game**. The whole protocol in [docs/protocol.md](docs/protocol.md) is
+implemented and covered by tests: room list, hosting (with PING/PONG), joining and pairing, and the relay itself.
+Still to do: per-IP connection limits (error 6).
 
 - Architecture plan: see the Lords2HD architecture document (link to be added).
 - Wire protocol (draft): [docs/protocol.md](docs/protocol.md)

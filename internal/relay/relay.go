@@ -5,6 +5,7 @@ package relay
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -56,6 +57,8 @@ const (
 const (
 	PingInterval = 15 * time.Second
 	PongTimeout  = 15 * time.Second
+	PairCodeSize = 16
+	PairTimeout  = 10 * time.Second
 )
 
 // TODO: more constants from docs/protocol.md, so the code has no bare numbers:
@@ -388,6 +391,87 @@ func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {
 }
 
 func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
+	var buf [4]byte
+	_, err := io.ReadFull(conn, buf[:])
+
+	if err != nil {
+		log.Warn("error reading room id", "reason", err)
+		return
+	}
+
+	requestedRoom := binary.LittleEndian.Uint32(buf[:])
+
+	room, err := s.rooms.Get(requestedRoom)
+
+	// check if room exists
+	if err != nil {
+		log.Warn("joiner requested invalid room", "value", requestedRoom)
+		_, _ = conn.Write([]byte{ErrCodeNoRoom})
+		return
+	}
+
+	// check if room is full or locked
+	if room.Locked || room.Players >= room.MaxPlayers {
+		log.Warn("join failed", "reason", "room is either full or locked", "room", room.ID)
+		_, _ = conn.Write([]byte{ErrCodeRoomClosed})
+		return
+	}
+
+	s.mu.Lock()
+	hc := s.hosts[room.ID]
+	s.mu.Unlock()
+
+	// check if host is still connected
+	if hc == nil {
+		log.Warn("join failed", "reason", "host has disconnected")
+		_, _ = conn.Write([]byte{ErrCodeNoRoom})
+		return
+	}
+
+	var code [PairCodeSize]byte
+	rand.Read(code[:])
+
+	w := &waitingJoiner{
+		conn: conn,
+		done: make(chan struct{}),
+	}
+
+	s.mu.Lock()
+	s.waiting[code] = w
+	s.mu.Unlock()
+
+	err = hc.send(JOIN, code[:])
+
+	if err != nil {
+		log.Warn("join failed", "reason", err)
+		_, _ = conn.Write([]byte{ErrCodeNoRoom})
+		s.mu.Lock()
+		delete(s.waiting, code)
+		s.mu.Unlock()
+		return
+	}
+
+	select {
+
+	case <-w.done:
+		return // game played and finished
+	case <-time.After(PairTimeout):
+		// host never showed up (handled below)
+	}
+
+	s.mu.Lock()
+	if s.waiting[code] == w {
+		// still ours: nobody claimed it
+		delete(s.waiting, code)
+		s.mu.Unlock()
+		log.Info("join timed out", "room", room.ID)
+		_, _ = conn.Write([]byte{ErrCodeTimeout})
+		return
+	}
+	s.mu.Unlock()
+	// the host claimed it at the last moment → wait for the game to end
+	<-w.done
+
 }
 
 // pipe copies bytes both ways between two connections until either side closes.

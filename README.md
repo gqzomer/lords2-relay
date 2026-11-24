@@ -48,6 +48,22 @@ Settings (environment variables):
 |---|---|---|
 | `LOBBY_ADDR` | `:47701` | read-only HTTP address (room list, health check) |
 | `RELAY_ADDR` | `:47700` | TCP relay address |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`; see "Logs" below |
+
+## Logs
+
+One line per event, as `key=value` text on stdout. On the VPS: `cd /opt/lords2-relay && docker compose logs relay`
+(kept: 5 files of 10 MB).
+
+| Level | Means | Examples |
+|---|---|---|
+| `ERROR` | the server itself is broken | a listener stopped |
+| `WARN` | a client broke the protocol: a bug in dplayx.dll or the relay | bad HOST payload, host stopped answering PING, join timed out |
+| `INFO` | rooms and games, including normal refusals | room opened/closed, join requested, game connection started/ended (with bytes), room full |
+| `DEBUG` | noise | port scanners, room list requests, UPDATEs |
+
+Every line of a connection has `remote` and `role`, and once known `room` and `pair` (the start of the pair_code,
+linking a joiner to the host's data connection). To follow one room: `docker compose logs relay | grep room=<id>`.
 
 ## Deploying to DigitalOcean
 
@@ -61,15 +77,8 @@ Settings (environment variables):
 
 ## To do
 
-- [x] Registry: `Create`, `Update`, `Remove` in `internal/lobby/registry.go` (start from `List`), with tests
-- [ ] Registry: `Get` for one room, for the joining checks (exists, not locked, not full), with a test
-- [ ] Relay: protocol constants (`RoleList`, frame types, error codes, timings)
-- [ ] Relay: read and check the header (`internal/relay/relay.go`, `handle`)
-- [ ] Relay: frame reading and writing (`len`, `type`, `payload`)
-- [ ] Relay: list connections (LIST, ROOMS)
-- [ ] Relay: control connections (HOST, HOSTED, UPDATE, PING/PONG); the room is removed when the connection closes
-- [ ] Relay: joining (JOIN, pair codes, status byte), then `pipe`
-- [ ] Relay: tests for `handle`, one per step above (`internal/relay/relay_test.go`)
+- [x] Registry: `Create`, `Update`, `Remove`, `Get` in `internal/lobby/registry.go`, with tests
+- [x] Relay: header, frames, list, control (with PING/PONG), joining and pairing, with tests
 - [x] HTTP: drop the host routes from `internal/lobby/handler.go`, keep `/v1/rooms` and `/healthz`; drop `ExpireLoop`
 - [ ] Limits per IP address (rooms, connections)
 - [ ] Phase 0 on a VPS: a plain TCP forward to measure how a relay feels in a real game

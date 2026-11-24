@@ -1,6 +1,15 @@
 // Package relay accepts TCP connections from dplayx.dll, pairs a joiner's
 // connection with a new connection from the host, and copies bytes between them.
 // The wire format is in docs/protocol.md.
+//
+// Log levels:
+//   - Error: the server itself is broken (only in main: a listener stopped).
+//   - Warn:  a client that speaks our protocol broke it: a bug in dplayx.dll or in this relay. Worth a look.
+//   - Info:  the life of rooms and games, including normal refusals (room full, old version).
+//   - Debug: noise: connections that are not ours (scanners), room list requests, UPDATEs.
+//
+// Every line of a connection has remote and role; once known also room, and pair (the first bytes of the
+// pair_code, in hex), which links a joiner's lines to the host's data connection for that joiner.
 package relay
 
 import (
@@ -9,6 +18,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -123,6 +133,7 @@ func (h *hostConn) send(typ byte, payload []byte) error {
 // waitingJoiner is a joiner whose host has not connected its data connection yet.
 type waitingJoiner struct {
 	conn net.Conn
+	room uint32        // for the log of the host data connection
 	done chan struct{} // closed once the game connection has ended
 }
 
@@ -182,7 +193,7 @@ func (s *Server) handle(conn net.Conn) {
 	_, err := io.ReadFull(conn, buf[:])
 
 	if err != nil {
-		log.Warn("reading header", "err", err)
+		log.Debug("no header", "err", err) // port scanners, health probes
 		return
 	}
 
@@ -191,12 +202,14 @@ func (s *Server) handle(conn net.Conn) {
 	bufRole := buf[5]
 
 	if bufMagic != Magic {
-		log.Warn("bad header", "reason", "wrong magic", "got", bufMagic)
+		log.Debug("not our protocol", "magic", bufMagic) // slog quotes and escapes it
 		return
 	}
 
+	log = log.With("role", roleName(bufRole))
+
 	if bufVersion != Version {
-		log.Warn("bad header", "reason", "wrong version", "got", bufVersion)
+		log.Info("refused: old or new client version", "version", bufVersion, "want", Version)
 		// Tell the client to update, in the form its role expects. An unknown role gets no answer.
 		switch bufRole {
 		case RoleControl, RoleList:
@@ -217,21 +230,39 @@ func (s *Server) handle(conn net.Conn) {
 	case RoleJoinerData:
 		s.handleJoiner(conn, log)
 	default:
-		log.Warn("bad header", "reason", "invalid role", "got", bufRole)
-		return
+		log.Warn("bad header: unknown role", "role_byte", bufRole)
 	}
+}
+
+func roleName(role byte) string {
+	switch role {
+	case RoleControl:
+		return "control"
+	case RoleHostData:
+		return "host-data"
+	case RoleJoinerData:
+		return "joiner"
+	case RoleList:
+		return "list"
+	}
+	return fmt.Sprintf("unknown(%d)", role)
+}
+
+// pairID is the first bytes of a pair_code, enough to link log lines without logging the secret itself.
+func pairID(code [PairCodeSize]byte) string {
+	return hex.EncodeToString(code[:4])
 }
 
 func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
 	typ, payload, err := readFrame(conn)
 
 	if err != nil {
-		log.Warn("failed to read frame", "reason", err)
+		log.Warn("reading LIST", "err", err)
 		return
 	}
 
 	if typ != LIST || len(payload) != 0 {
-		log.Warn("failed to read frame", "reason", "unexpected type or payload")
+		log.Warn("bad LIST frame", "type", typ, "payload", fmt.Sprintf("% x", payload))
 		return
 	}
 
@@ -260,20 +291,22 @@ func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
 	err = writeFrame(conn, ROOMS, b)
 
 	if err != nil {
-		log.Warn("failed to write frame", "reason", err)
+		log.Info("sending ROOMS", "err", err)
+		return
 	}
+	log.Debug("room list sent", "rooms", len(rooms))
 }
 
 func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 	typ, payload, err := readFrame(conn)
 
 	if err != nil {
-		log.Warn("failed to read frame", "reason", err)
+		log.Warn("reading HOST", "err", err)
 		return
 	}
 
 	if typ != HOST {
-		log.Warn("failed to read frame", "reason", "first frame is not HOST", "type", typ)
+		log.Warn("first frame is not HOST", "type", typ)
 		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
 		return
 	}
@@ -284,7 +317,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 	name := r.str()
 
 	if err := r.done(); err != nil {
-		log.Warn("bad HOST payload", "payload", payload)
+		log.Warn("bad HOST payload", "payload", fmt.Sprintf("% x", payload))
 		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
 		return
 	}
@@ -292,11 +325,13 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 	room, err := s.rooms.Create(name, int(roomSize), proto)
 
 	if err != nil {
-		log.Warn("failed to create a room", "reason", err)
+		log.Warn("HOST refused", "err", err, "name", name, "max_players", roomSize, "proto", proto)
 		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
 		return
 	}
 
+	log = log.With("room", room.ID)
+	start := time.Now()
 	defer s.rooms.Remove(room.ID)
 
 	hc := &hostConn{conn: conn}
@@ -314,13 +349,13 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 	err = writeFrame(conn, HOSTED, appendU32(nil, room.ID))
 
 	if err != nil {
-		log.Warn("failed to create a room", "reason", err)
+		log.Info("host left before HOSTED", "err", err)
 		return
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(PingInterval + PongTimeout))
 
-	log.Info("room created", "id", room.ID, "name", name)
+	log.Info("room opened", "name", name, "max_players", roomSize, "proto", proto)
 
 	// The PING goroutine. close(done) stops it when handleControl returns.
 	done := make(chan struct{})
@@ -345,7 +380,16 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 	for {
 		typ, payload, err := readFrame(conn)
 		if err != nil {
-			log.Info("host disconnected", "reason", err)
+			up := time.Since(start).Round(time.Second)
+			var ne net.Error
+			switch {
+			case errors.Is(err, io.EOF):
+				log.Info("room closed by host", "up", up)
+			case errors.As(err, &ne) && ne.Timeout():
+				log.Warn("room closed: host stopped answering PING", "up", up)
+			default:
+				log.Info("room closed", "err", err, "up", up)
+			}
 			return
 		}
 
@@ -356,7 +400,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 			locked := r.u8()
 
 			if err := r.done(); err != nil || locked > 1 {
-				log.Warn("bad UPDATE payload", "payload", payload)
+				log.Warn("bad UPDATE payload", "payload", fmt.Sprintf("% x", payload))
 				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 				return
 			}
@@ -364,17 +408,18 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 			err := s.rooms.Update(room.ID, int(players), locked == 1)
 
 			if err != nil {
-				log.Warn("failed to update room", "reason", err)
+				log.Warn("UPDATE refused", "err", err, "players", players, "locked", locked)
 				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 				return
 			}
+			log.Debug("room updated", "players", players, "locked", locked == 1)
 
 		case PONG:
 			// The host is alive: give it until the next PING plus PongTimeout.
 			_ = conn.SetReadDeadline(time.Now().Add(PingInterval + PongTimeout))
 
 		default:
-			log.Warn("unexpected frame type", "type", typ)
+			log.Warn("unexpected frame on control connection", "type", typ)
 			_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 			return
 		}
@@ -386,9 +431,10 @@ func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {
 	_, err := io.ReadFull(conn, code[:])
 
 	if err != nil {
-		log.Warn("error reading pair code", "reason", err)
+		log.Warn("reading pair_code", "err", err)
 		return
 	}
+	log = log.With("pair", pairID(code))
 
 	s.mu.Lock()
 	w := s.waiting[code]
@@ -398,11 +444,13 @@ func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {
 	s.mu.Unlock()
 
 	if w == nil {
-		log.Warn("no connection available for pair code", "code", hex.EncodeToString(code[:]))
+		log.Warn("unknown or expired pair_code") // a host that answered JOIN too late, or a bad code
 		_, _ = conn.Write([]byte{ErrCodeBadRequest})
 		return
 	}
 	defer close(w.done)
+
+	log = log.With("room", w.room, "joiner", w.conn.RemoteAddr().String())
 
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = w.conn.SetReadDeadline(time.Time{})
@@ -410,9 +458,13 @@ func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {
 	_, _ = conn.Write([]byte{StatusOK})
 	_, _ = w.conn.Write([]byte{StatusOK})
 
-	log.Info("paired succesfully")
+	log.Info("game connection started")
+	start := time.Now()
 
-	pipe(conn, w.conn)
+	toJoiner, toHost := pipe(conn, w.conn)
+
+	log.Info("game connection ended", "duration", time.Since(start).Round(time.Second),
+		"bytes_to_joiner", toJoiner, "bytes_to_host", toHost)
 }
 
 func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
@@ -420,24 +472,26 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 	_, err := io.ReadFull(conn, buf[:])
 
 	if err != nil {
-		log.Warn("error reading room id", "reason", err)
+		log.Warn("reading room_id", "err", err)
 		return
 	}
 
 	requestedRoom := binary.LittleEndian.Uint32(buf[:])
+	log = log.With("room", requestedRoom)
 
 	room, err := s.rooms.Get(requestedRoom)
 
 	// check if room exists
 	if err != nil {
-		log.Warn("joiner requested invalid room", "value", requestedRoom)
+		log.Info("join refused: no such room")
 		_, _ = conn.Write([]byte{ErrCodeNoRoom})
 		return
 	}
 
 	// check if room is full or locked
 	if room.Locked || room.Players >= room.MaxPlayers {
-		log.Warn("join failed", "reason", "room is either full or locked", "room", room.ID)
+		log.Info("join refused: room full or locked", "players", room.Players, "max_players", room.MaxPlayers,
+			"locked", room.Locked)
 		_, _ = conn.Write([]byte{ErrCodeRoomClosed})
 		return
 	}
@@ -448,7 +502,7 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 
 	// check if host is still connected
 	if hc == nil {
-		log.Warn("join failed", "reason", "host has disconnected")
+		log.Info("join refused: host is disconnecting")
 		_, _ = conn.Write([]byte{ErrCodeNoRoom})
 		return
 	}
@@ -456,8 +510,11 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 	var code [PairCodeSize]byte
 	rand.Read(code[:])
 
+	log = log.With("pair", pairID(code))
+
 	w := &waitingJoiner{
 		conn: conn,
+		room: room.ID,
 		done: make(chan struct{}),
 	}
 
@@ -468,7 +525,7 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 	err = hc.send(JOIN, code[:])
 
 	if err != nil {
-		log.Warn("join failed", "reason", err)
+		log.Info("join refused: sending JOIN to the host failed", "err", err)
 		_, _ = conn.Write([]byte{ErrCodeNoRoom})
 		s.mu.Lock()
 		delete(s.waiting, code)
@@ -476,8 +533,9 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 		return
 	}
 
-	select {
+	log.Info("join requested, JOIN sent to host")
 
+	select {
 	case <-w.done:
 		return // game played and finished
 	case <-time.After(PairTimeout):
@@ -489,7 +547,7 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 		// still ours: nobody claimed it
 		delete(s.waiting, code)
 		s.mu.Unlock()
-		log.Info("join timed out", "room", room.ID)
+		log.Warn("join timed out: host did not open its data connection", "after", PairTimeout)
 		_, _ = conn.Write([]byte{ErrCodeTimeout})
 		return
 	}
@@ -499,23 +557,25 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 
 }
 
-// pipe copies bytes both ways between two connections until either side closes.
+// pipe copies bytes both ways between two connections until either side closes,
+// and returns how many bytes went each way (for the log).
 // Finished helper: this is the whole "relay" part once two connections are paired.
-func pipe(a, b net.Conn) {
+func pipe(a, b net.Conn) (aToB, bToA int64) {
 	noDelay(a) // small game messages go out at once (Nagle off), as dplayx.dll does
 	noDelay(b)
 
 	done := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(a, b)
+		bToA, _ = io.Copy(a, b)
 		closeWrite(a)
 		close(done)
 	}()
-	_, _ = io.Copy(b, a)
+	aToB, _ = io.Copy(b, a)
 	closeWrite(b)
 	<-done
 	a.Close()
 	b.Close()
+	return aToB, bToA
 }
 
 func noDelay(c net.Conn) {

@@ -19,7 +19,12 @@ import (
 
 func main() {
 	cfg := config.FromEnv()
-	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	var level slog.Level
+	levelErr := level.UnmarshalText([]byte(cfg.LogLevel))
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	if levelErr != nil {
+		log.Warn("bad LOG_LEVEL, using info", "got", cfg.LogLevel)
+	}
 
 	// ctx is cancelled on Ctrl+C or when Docker stops the container (SIGTERM).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

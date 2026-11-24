@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -46,6 +47,7 @@ const (
 )
 
 const (
+	StatusOK          = 0
 	ErrCodeVersion    = 1
 	ErrCodeBadRequest = 2
 	ErrCodeNoRoom     = 3
@@ -388,6 +390,37 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 }
 
 func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {
+	var code [PairCodeSize]byte
+	_, err := io.ReadFull(conn, code[:])
+
+	if err != nil {
+		log.Warn("error reading pair code", "reason", err)
+		return
+	}
+
+	s.mu.Lock()
+	w := s.waiting[code]
+	if w != nil {
+		delete(s.waiting, code)
+	}
+	s.mu.Unlock()
+
+	if w == nil {
+		log.Warn("no connection available for pair code", "code", hex.EncodeToString(code[:]))
+		_, _ = conn.Write([]byte{ErrCodeBadRequest})
+		return
+	}
+	defer close(w.done)
+
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = w.conn.SetReadDeadline(time.Time{})
+
+	_, _ = conn.Write([]byte{StatusOK})
+	_, _ = w.conn.Write([]byte{StatusOK})
+
+	log.Info("paired succesfully")
+
+	pipe(conn, w.conn)
 }
 
 func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {

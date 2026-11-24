@@ -202,6 +202,13 @@ func (s *Server) handle(conn net.Conn) {
 
 	if bufVersion != Version {
 		log.Warn("bad header", "reason", "wrong version", "got", bufVersion)
+		// Tell the client to update, in the form its role expects. An unknown role gets no answer.
+		switch bufRole {
+		case RoleControl, RoleList:
+			_ = writeFrame(conn, ERROR, []byte{ErrCodeVersion})
+		case RoleHostData, RoleJoinerData:
+			_, _ = conn.Write([]byte{ErrCodeVersion})
+		}
 		return
 	}
 

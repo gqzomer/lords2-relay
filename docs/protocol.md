@@ -27,7 +27,8 @@ There are four kinds of TCP connection, picked by the `role` byte in the header:
 - `str`: a `u8` length followed by that many bytes of UTF-8, no terminating zero. The DLL converts from and to the
   Windows code page.
 - Room ids are random `u32` values, never 0.
-- The relay closes any connection that breaks a rule below, without an answer unless an answer is listed.
+- The relay closes any connection that breaks a rule below, without an answer unless an answer is listed. Values
+  that are merely out of range in HOST and UPDATE are the exception: they are corrected, not refused (see Limits).
 
 ## Header
 
@@ -54,11 +55,12 @@ Control and list connections carry frames:
 
 | Bytes | Field |
 |---|---|
-| 0–1 | `len` (`u16`): length of `type` + `payload` |
-| 2 | `type` (`u8`) |
-| 3… | `payload` (`len - 1` bytes) |
+| 0–3 | `len` (`u32`): length of `type` + `payload` |
+| 4 | `type` (`u8`) |
+| 5… | `payload` (`len - 1` bytes) |
 
-A frame is at most 1024 bytes (`len` ≤ 1024). A frame type a side does not know is an error.
+The same layout as dplayx.dll's own frames, so the DLL reads and writes them with its `sendf` / `readf2`. `len` is at
+most 1024. A frame type a side does not know is an error.
 
 ### Control (role 1)
 
@@ -78,17 +80,30 @@ A frame is at most 1024 bytes (`len` ≤ 1024). A frame type a side does not kno
 4. When the control connection closes, for any reason, the room is removed. Game connections already paired keep running.
    There is no "close room" frame: the host simply closes the connection.
 
-Limits: `name` 1–32 bytes, `max_players` 2–5 (the game has five nobles), `players` 1–`max_players`.
+Limits: `name` 1–32 bytes of UTF-8, `max_players` 2–5 (the game has five nobles), `players` 1–`max_players`,
+`locked` 0 or 1. The relay **corrects** values outside these limits instead of refusing them, and logs a warning:
+
+| Value | Becomes |
+|---|---|
+| empty `name` (or only spaces) | `Lords2 game` (no warning: allowed) |
+| `name` over 32 bytes | cut to 32 bytes, never inside a character |
+| `name` not valid UTF-8 | each bad byte becomes `?` |
+| `max_players` outside 2–5 | 2 or 5 |
+| `players` outside 1–`max_players` | 1 or `max_players` (e.g. 0 before the host's own player exists) |
+| `locked` above 1 | locked |
+
+A frame that is too short or too long for its type is still an error (2) and closes the connection.
 
 ### List (role 4)
 
 | Type | Name | Direction | Payload |
 |---|---|---|---|
 | 8 | LIST | client → relay | – |
-| 9 | ROOMS | relay → client | `count u8`, then `count` times: `room_id u32`, `proto u32`, `players u8`, `max_players u8`, `locked u8`, `name str` |
+| 9 | ROOMS | relay → client | `count u8`, then `count` times: `room_id u32`, `proto u32`, `players u8`, `max_players u8`, `name str` |
 
-The client sends one LIST; the relay answers one ROOMS and closes. Rooms are oldest first, at most 20. All PROTOs are
-listed: the DLL shows rooms from another build as incompatible, as it does on a LAN.
+The client sends one LIST; the relay answers one ROOMS and closes. Rooms are oldest first, at most 20. Locked rooms
+(game started) are left out, since nobody can join them; the HTTP list still shows them. All PROTOs are listed: the
+DLL shows rooms from another build as incompatible, as it does on a LAN. Full rooms are listed too.
 
 ## Joining
 
@@ -96,10 +111,23 @@ listed: the DLL shows rooms from another build as incompatible, as it does on a 
 2. The relay checks the room (exists, not locked, not full), makes a fresh random 16-byte `pair_code` and sends JOIN with it
    on the host's control connection.
 3. The host opens a **host data** connection (role 2, that `pair_code`).
-4. The relay sends one status byte on each data connection, `0` = paired, and from then on copies bytes both ways. From
-   here on it is the normal dplayx.dll game protocol.
+4. The relay answers on each data connection, and from then on copies bytes both ways. From here on it is the normal
+   dplayx.dll game protocol.
+   - **Joiner data:** one status byte, `0` = paired.
+   - **Host data:** status `0`, then a 4-byte `joiner_id`. It stands for the joiner's IP address without revealing
+     it: the same address gets the same id for as long as the relay runs, so the host can apply per-address limits
+     (dplayx.dll uses it where it would use the address from `accept()`). It is a keyed hash (HMAC-SHA256 with a
+     random key made at each relay start), so it cannot be turned back into an address, and ids from different relay
+     runs do not match.
 
 If pairing fails, the relay sends one non-zero status byte (see Error codes) on that data connection and closes it.
+Only a successful host data answer has the 4 `joiner_id` bytes.
+
+## Privacy
+
+Players never learn each other's IP addresses: every connection goes to the relay, the relay sends no addresses to
+anyone (the host gets only `joiner_id`), and the HTTP list has none. Only the relay's own log has addresses (the
+`remote` field), for the server's operator.
 
 The `pair_code` exists only between the relay and the host; the joiner never sees it. It is valid for 10 s and for one
 pairing only.

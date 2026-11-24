@@ -6,13 +6,13 @@ import (
 	"testing"
 )
 
-// mustCreate is a test helper: it creates a room or stops the test.
+// mustCreate is a test helper: it creates a room and checks it kept the name and size it was given.
 // t.Helper() makes a failure point at the caller's line instead of this one.
 func mustCreate(t *testing.T, r *Registry, name string, maxPlayers int, proto uint32) Room {
 	t.Helper()
-	room, err := r.Create(name, maxPlayers, proto)
-	if err != nil {
-		t.Fatalf("Create(%q, %d, %d): %v", name, maxPlayers, proto, err)
+	room := r.Create(name, maxPlayers, proto)
+	if room.Name != name || room.MaxPlayers != maxPlayers {
+		t.Fatalf("Create(%q, %d, %d) stored %q, %d", name, maxPlayers, proto, room.Name, room.MaxPlayers)
 	}
 	return room
 }
@@ -45,35 +45,43 @@ func TestCreate(t *testing.T) {
 
 // A table-driven test: one row per case, the same check for each.
 // This is the usual way to test many inputs in Go.
-func TestCreateValidation(t *testing.T) {
+// Create never refuses: it stores a corrected name and size.
+func TestCreateCorrects(t *testing.T) {
 	tests := []struct {
 		name       string // the test case's name, shown when it fails
 		roomName   string
 		maxPlayers int
-		wantErr    error // nil = must succeed
+		wantName   string
+		wantMax    int
 	}{
-		{"ok", "game", 4, nil},
-		{"smallest room", "game", MinPlayers, nil},
-		{"largest room", "game", MaxPlayers, nil},
-		{"longest name", strings.Repeat("a", MaxNameLen), 4, nil},
-		{"name of multi-byte characters", "Château de Gersom", 4, nil},
-		{"empty name", "", 4, ErrBadRequest},
-		{"name too long", strings.Repeat("a", MaxNameLen+1), 4, ErrBadRequest},
-		{"name too long in bytes", strings.Repeat("é", 17), 4, ErrBadRequest}, // 17 characters, 34 bytes
-		{"name not UTF-8", "game\xff", 4, ErrBadRequest},
-		{"one player", "game", 1, ErrBadRequest},
-		{"six players", "game", 6, ErrBadRequest},
-		{"negative players", "game", -1, ErrBadRequest},
+		{"ok", "game", 4, "game", 4},
+		{"smallest room", "game", MinPlayers, "game", MinPlayers},
+		{"largest room", "game", MaxPlayers, "game", MaxPlayers},
+		{"longest name", strings.Repeat("a", MaxNameLen), 4, strings.Repeat("a", MaxNameLen), 4},
+		{"name of multi-byte characters", "Château de Gersom", 4, "Château de Gersom", 4},
+		{"empty name", "", 4, DefaultName, 4},
+		{"only spaces", "   ", 4, DefaultName, 4},
+		{"spaces around", "  game ", 4, "game", 4},
+		{"name too long", strings.Repeat("a", MaxNameLen+1), 4, strings.Repeat("a", MaxNameLen), 4},
+		// 17 characters, 34 bytes: cut to 16 whole characters (32 bytes), never half an "é"
+		{"name too long in bytes", strings.Repeat("é", 17), 4, strings.Repeat("é", 16), 4},
+		{"name too long, cut inside a character", "a" + strings.Repeat("é", 16), 4, "a" + strings.Repeat("é", 15), 4},
+		{"name not UTF-8", "game\xff", 4, "game?", 4},
+		{"one player", "game", 1, "game", MinPlayers},
+		{"six players", "game", 6, "game", MaxPlayers},
+		{"sixteen players", "game", 16, "game", MaxPlayers},
+		{"negative players", "game", -1, "game", MinPlayers},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := NewRegistry()
-			_, err := r.Create(tt.roomName, tt.maxPlayers, 1)
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("Create(%q, %d) error = %v, want %v", tt.roomName, tt.maxPlayers, err, tt.wantErr)
+			room := r.Create(tt.roomName, tt.maxPlayers, 1)
+			if room.Name != tt.wantName || room.MaxPlayers != tt.wantMax {
+				t.Errorf("Create(%q, %d) stored %q, %d; want %q, %d",
+					tt.roomName, tt.maxPlayers, room.Name, room.MaxPlayers, tt.wantName, tt.wantMax)
 			}
-			if err != nil && len(r.List(0)) != 0 {
-				t.Error("Create failed but the room was added anyway")
+			if got, _ := r.Get(room.ID); got != room {
+				t.Errorf("Get = %+v, want what Create returned, %+v", got, room)
 			}
 		})
 	}
@@ -98,24 +106,26 @@ func TestUpdate(t *testing.T) {
 	r := NewRegistry()
 	room := mustCreate(t, r, "game", 4, 1)
 
-	if err := r.Update(room.ID, 3, true); err != nil {
+	got, err := r.Update(room.ID, 3, true)
+	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	got := r.List(0)[0]
 	if got.Players != 3 || !got.Locked {
 		t.Errorf("after Update(3, locked): players=%d locked=%v", got.Players, got.Locked)
 	}
+	if stored := r.List(0)[0]; stored != got {
+		t.Errorf("Update returned %+v, but the registry has %+v", got, stored)
+	}
 
-	for _, players := range []int{0, 5} { // 5 is more than this room's max of 4
-		if err := r.Update(room.ID, players, false); !errors.Is(err, ErrBadRequest) {
-			t.Errorf("Update with %d players: error = %v, want ErrBadRequest", players, err)
+	// Out of range: corrected into 1..max (4 here), not refused.
+	for _, tc := range []struct{ players, want int }{{0, 1}, {-3, 1}, {5, 4}, {200, 4}} {
+		got, err := r.Update(room.ID, tc.players, false)
+		if err != nil || got.Players != tc.want {
+			t.Errorf("Update with %d players: got %d players, err %v; want %d", tc.players, got.Players, err, tc.want)
 		}
 	}
-	if got := r.List(0)[0]; got.Players != 3 || !got.Locked {
-		t.Errorf("a refused Update changed the room: players=%d locked=%v", got.Players, got.Locked)
-	}
 
-	if err := r.Update(room.ID+1, 2, false); !errors.Is(err, ErrNoRoom) {
+	if _, err := r.Update(room.ID+1, 2, false); !errors.Is(err, ErrNoRoom) {
 		t.Errorf("Update of an unknown room: error = %v, want ErrNoRoom", err)
 	}
 }
@@ -140,7 +150,7 @@ func TestRemove(t *testing.T) {
 func TestGet(t *testing.T) {
 	r := NewRegistry()
 	room := mustCreate(t, r, "game", 4, 7)
-	if err := r.Update(room.ID, 2, true); err != nil {
+	if _, err := r.Update(room.ID, 2, true); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 

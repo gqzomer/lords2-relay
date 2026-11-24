@@ -14,7 +14,9 @@ package relay
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -41,7 +43,8 @@ const (
 	Version        = 1
 	HeaderSize     = 6
 	MaxRooms       = 20
-	MaxFrameLength = 1024
+	MaxFrameLength = 1024 // len of a frame (type + payload), at most
+	FrameLenSize   = 4    // len is a u32, as in dplayx.dll's own frames, so the DLL reuses its sendf / readf2
 )
 
 const (
@@ -76,14 +79,14 @@ const (
 
 func readFrame(conn net.Conn) (typ byte, payload []byte, err error) {
 
-	var buf [2]byte
+	var buf [FrameLenSize]byte
 	_, err = io.ReadFull(conn, buf[:])
 
 	if err != nil {
 		return 0, nil, err
 	}
 
-	var framelen = binary.LittleEndian.Uint16(buf[:])
+	var framelen = binary.LittleEndian.Uint32(buf[:])
 
 	if framelen == 0 || framelen > MaxFrameLength {
 		return 0, nil, errors.New("frame too long")
@@ -104,11 +107,11 @@ func writeFrame(conn net.Conn, typ byte, payload []byte) error {
 		return errors.New("payload too large")
 	}
 
-	total := 3 + len(payload) // 2 length bytes + 1 type byte + payload
+	total := FrameLenSize + 1 + len(payload) // length + type byte + payload
 
 	b := make([]byte, 0, total)
 
-	b = appendU16(b, uint16(1+len(payload)))
+	b = appendU32(b, uint32(1+len(payload)))
 	b = appendU8(b, typ)
 	b = append(b, payload...)
 
@@ -144,18 +147,21 @@ type Server struct {
 	mu      sync.Mutex                  // guards hosts and waiting
 	hosts   map[uint32]*hostConn        // room id -> control connection
 	waiting map[[16]byte]*waitingJoiner // pair_code -> joiner
+	idKey   [32]byte                    // random per run: the key for joinerID
 
 	// TODO (later): connection counts per IP address, to answer error 6 (server full / too many connections)
 }
 
 func New(addr string, rooms *lobby.Registry, log *slog.Logger) *Server {
-	return &Server{
+	s := &Server{
 		addr:    addr,
 		rooms:   rooms,
 		log:     log,
 		hosts:   make(map[uint32]*hostConn),
 		waiting: make(map[[16]byte]*waitingJoiner),
 	}
+	rand.Read(s.idKey[:])
+	return s
 }
 
 // ListenAndServe accepts connections until ctx is cancelled.
@@ -266,25 +272,21 @@ func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
 		return
 	}
 
-	rooms := s.rooms.List(0)
-
-	if len(rooms) > MaxRooms {
-		rooms = rooms[:MaxRooms]
+	// Only rooms a player can still join: a locked room (game started) is left out. The HTTP list still shows it.
+	rooms := make([]lobby.Room, 0, MaxRooms)
+	for _, room := range s.rooms.List(0) {
+		if !room.Locked && len(rooms) < MaxRooms {
+			rooms = append(rooms, room)
+		}
 	}
 
-	b := make([]byte, 0, 1+len(rooms)*44) // a room takes at most 44 bytes
+	b := make([]byte, 0, 1+len(rooms)*43) // a room takes at most 43 bytes
 	b = append(b, byte(len(rooms)))
 	for _, room := range rooms {
-		var locked byte
-		if room.Locked {
-			locked = 1
-		}
-
 		b = appendU32(b, room.ID)
 		b = appendU32(b, room.Proto)
 		b = appendU8(b, uint8(room.Players))
 		b = appendU8(b, uint8(room.MaxPlayers))
-		b = appendU8(b, locked)
 		b = appendStr(b, room.Name)
 	}
 
@@ -322,15 +324,15 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 		return
 	}
 
-	room, err := s.rooms.Create(name, int(roomSize), proto)
-
-	if err != nil {
-		log.Warn("HOST refused", "err", err, "name", name, "max_players", roomSize, "proto", proto)
-		_ = writeFrame(conn, ERROR, []byte{ErrCodeBadRequest})
-		return
-	}
-
+	// Out-of-range values are corrected, not refused: hosting must not fail over a detail.
+	// An empty name is allowed (it becomes lobby.DefaultName); anything else that changed is a DLL bug.
+	room := s.rooms.Create(name, int(roomSize), proto)
 	log = log.With("room", room.ID)
+
+	if (name != "" && room.Name != name) || room.MaxPlayers != int(roomSize) {
+		log.Warn("HOST values corrected", "name", name, "stored_name", room.Name,
+			"max_players", roomSize, "stored_max_players", room.MaxPlayers)
+	}
 	start := time.Now()
 	defer s.rooms.Remove(room.ID)
 
@@ -355,7 +357,7 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 
 	_ = conn.SetReadDeadline(time.Now().Add(PingInterval + PongTimeout))
 
-	log.Info("room opened", "name", name, "max_players", roomSize, "proto", proto)
+	log.Info("room opened", "name", room.Name, "max_players", room.MaxPlayers, "proto", proto)
 
 	// The PING goroutine. close(done) stops it when handleControl returns.
 	done := make(chan struct{})
@@ -399,20 +401,25 @@ func (s *Server) handleControl(conn net.Conn, log *slog.Logger) {
 			players := r.u8()
 			locked := r.u8()
 
-			if err := r.done(); err != nil || locked > 1 {
+			if err := r.done(); err != nil {
 				log.Warn("bad UPDATE payload", "payload", fmt.Sprintf("% x", payload))
 				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
 				return
 			}
 
-			err := s.rooms.Update(room.ID, int(players), locked == 1)
+			// Like HOST: values out of range are corrected (players into 1..max_players, locked: any non-zero
+			// is locked) and logged, and the room stays.
+			updated, err := s.rooms.Update(room.ID, int(players), locked != 0)
 
-			if err != nil {
-				log.Warn("UPDATE refused", "err", err, "players", players, "locked", locked)
-				_ = hc.send(ERROR, []byte{ErrCodeBadRequest})
+			if err != nil { // cannot happen while this connection is open: only handleControl removes its room
+				log.Error("UPDATE: room missing from the registry", "err", err)
 				return
 			}
-			log.Debug("room updated", "players", players, "locked", locked == 1)
+			if updated.Players != int(players) || locked > 1 {
+				log.Warn("UPDATE values corrected", "players", players, "stored_players", updated.Players,
+					"locked", locked)
+			}
+			log.Debug("room updated", "players", updated.Players, "locked", updated.Locked)
 
 		case PONG:
 			// The host is alive: give it until the next PING plus PongTimeout.
@@ -455,7 +462,9 @@ func (s *Server) handleHostData(conn net.Conn, log *slog.Logger) {
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = w.conn.SetReadDeadline(time.Time{})
 
-	_, _ = conn.Write([]byte{StatusOK})
+	// The host gets a joiner id instead of the joiner's address (which it must never learn), so dplayx.dll's
+	// per-address limits still tell players apart. The joiner gets the status byte alone.
+	_, _ = conn.Write(append([]byte{StatusOK}, s.joinerID(w.conn)...))
 	_, _ = w.conn.Write([]byte{StatusOK})
 
 	log.Info("game connection started")
@@ -555,6 +564,22 @@ func (s *Server) handleJoiner(conn net.Conn, log *slog.Logger) {
 	// the host claimed it at the last moment → wait for the game to end
 	<-w.done
 
+}
+
+// joinerID returns 4 bytes that stand for c's remote IP address without revealing it: the start of an HMAC-SHA256
+// of the address, keyed with idKey. The same address gets the same id for as long as the relay runs, so a host can
+// count connections per player; without idKey nobody can turn an id back into an address (not even by trying all
+// 2^32 IPv4 addresses), and a restart makes a new key, so ids from different runs cannot be linked.
+func (s *Server) joinerID(c net.Conn) []byte {
+	var addr []byte
+	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		addr = a.IP.To16() // one form for IPv4 and IPv4-mapped IPv6, so both give the same id
+	} else {
+		addr = []byte(c.RemoteAddr().String())
+	}
+	mac := hmac.New(sha256.New, s.idKey[:])
+	mac.Write(addr)
+	return mac.Sum(nil)[:4]
 }
 
 // pipe copies bytes both ways between two connections until either side closes,

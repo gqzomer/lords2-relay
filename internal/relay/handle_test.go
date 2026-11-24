@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,9 +112,19 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting until %s", what)
 }
 
+// readHostStatus reads the host data connection's answer when paired: status 0, then the 4-byte joiner id.
+func readHostStatus(t *testing.T, c net.Conn) (status byte, id []byte) {
+	t.Helper()
+	var b [5]byte
+	if _, err := io.ReadFull(c, b[:]); err != nil {
+		t.Fatalf("reading status and joiner id: %v", err)
+	}
+	return b[0], b[1:]
+}
+
 // pair runs the whole join: joiner connects, host gets JOIN, host opens its data connection.
-// It returns both data connections (status bytes already checked) and the pair code.
-func pair(t *testing.T, s *Server, ctl net.Conn, room uint32) (hostData, joiner net.Conn, code []byte) {
+// It returns both data connections (status bytes already checked), the pair code and the joiner id the host got.
+func pair(t *testing.T, s *Server, ctl net.Conn, room uint32) (hostData, joiner net.Conn, code, joinerID []byte) {
 	t.Helper()
 	joiner = dial(t, s, Version, RoleJoinerData, binary.LittleEndian.AppendUint32(nil, room))
 
@@ -123,13 +134,17 @@ func pair(t *testing.T, s *Server, ctl net.Conn, room uint32) (hostData, joiner 
 	}
 
 	hostData = dial(t, s, Version, RoleHostData, code)
-	if st := readStatus(t, hostData); st != StatusOK {
+	st, joinerID := readHostStatus(t, hostData)
+	if st != StatusOK {
 		t.Fatalf("host data status: got %d, want 0", st)
+	}
+	if ip := joiner.LocalAddr().(*net.TCPAddr).IP.To4(); bytes.Equal(joinerID, ip) {
+		t.Fatalf("the host got the joiner's address %v; it must get an id that hides it", ip)
 	}
 	if st := readStatus(t, joiner); st != StatusOK {
 		t.Fatalf("joiner status: got %d, want 0", st)
 	}
-	return hostData, joiner, code
+	return hostData, joiner, code, joinerID
 }
 
 // --- header ---
@@ -178,8 +193,11 @@ func TestWrongVersion(t *testing.T) {
 func TestList(t *testing.T) {
 	s := newTestServer()
 	for i := 0; i < MaxRooms+2; i++ {
-		if _, err := s.rooms.Create(string(rune('a'+i)), 4, 7); err != nil {
-			t.Fatal(err)
+		room := s.rooms.Create(string(rune('a'+i)), 4, 7)
+		if i == 1 { // a game that started: not in the list
+			if _, err := s.rooms.Update(room.ID, 2, true); err != nil {
+				t.Fatal(err)
+			}
 		}
 		time.Sleep(time.Millisecond) // distinct Created times, so "oldest first" is well defined
 	}
@@ -196,16 +214,23 @@ func TestList(t *testing.T) {
 		t.Fatalf("count: got %d, want %d", p[0], MaxRooms)
 	}
 
-	// First room: the oldest one, "a". Layout: id u32, proto u32, players, max_players, locked, name str.
-	r := p[1:]
-	if got := binary.LittleEndian.Uint32(r[4:8]); got != 7 {
-		t.Errorf("proto: got %d, want 7", got)
+	// Walk the rooms. Layout: id u32, proto u32, players u8, max_players u8, name str.
+	r := payloadReader{b: p[1:]}
+	var names []string
+	for range MaxRooms {
+		r.u32()
+		proto, players, maxPlayers, name := r.u32(), r.u8(), r.u8(), r.str()
+		if proto != 7 || players != 1 || maxPlayers != 4 {
+			t.Errorf("room %q: proto/players/max got %d/%d/%d, want 7/1/4", name, proto, players, maxPlayers)
+		}
+		names = append(names, name)
 	}
-	if r[8] != 1 || r[9] != 4 || r[10] != 0 {
-		t.Errorf("players/max/locked: got %d/%d/%d, want 1/4/0", r[8], r[9], r[10])
+	if err := r.done(); err != nil {
+		t.Fatalf("ROOMS payload: %v", err)
 	}
-	if name := string(r[12 : 12+r[11]]); name != "a" {
-		t.Errorf("first room: got %q, want the oldest, %q", name, "a")
+	// Oldest first, without the locked "b"; 22 rooms - 1 locked = 21, cut to 20, so "a", "c" ... "u".
+	if names[0] != "a" || names[1] != "c" || names[MaxRooms-1] != "u" {
+		t.Errorf("rooms: got %q, want a, c ... u (oldest first, locked b left out)", names)
 	}
 	expectClosed(t, c)
 }
@@ -257,9 +282,6 @@ func TestControlBadHost(t *testing.T) {
 		{"first frame is not HOST", UPDATE, []byte{1, 0}},
 		{"payload too short", HOST, []byte{1, 0, 0}},
 		{"name length does not match", HOST, append(hostPayload(4, "abc"), 'x')},
-		{"empty name", HOST, hostPayload(4, "")},
-		{"max_players too high", HOST, hostPayload(6, "abc")},
-		{"max_players too low", HOST, hostPayload(1, "abc")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -276,16 +298,80 @@ func TestControlBadHost(t *testing.T) {
 	}
 }
 
+// Values out of range in HOST are corrected, and the room opens anyway.
+func TestControlHostCorrected(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  []byte
+		wantName string
+		wantMax  int
+	}{
+		{"empty name", hostPayload(4, ""), lobby.DefaultName, 4},
+		{"name too long", hostPayload(4, strings.Repeat("x", 40)), strings.Repeat("x", lobby.MaxNameLen), 4},
+		{"max_players too high", hostPayload(16, "abc"), "abc", lobby.MaxPlayers},
+		{"max_players too low", hostPayload(1, "abc"), "abc", lobby.MinPlayers},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			c := dial(t, s, Version, RoleControl, nil)
+			if err := writeFrame(c, HOST, tc.payload); err != nil {
+				t.Fatal(err)
+			}
+			typ, payload := mustReadFrame(t, c)
+			if typ != HOSTED {
+				t.Fatalf("want HOSTED, got type %d payload % x", typ, payload)
+			}
+			room, err := s.rooms.Get(binary.LittleEndian.Uint32(payload))
+			if err != nil || room.Name != tc.wantName || room.MaxPlayers != tc.wantMax {
+				t.Errorf("room: got %+v (err %v), want name %q max %d", room, err, tc.wantName, tc.wantMax)
+			}
+		})
+	}
+}
+
+// Values out of range in UPDATE are corrected, and the room stays.
+func TestControlUpdateCorrected(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     []byte
+		wantPlayers int
+		wantLocked  bool
+	}{
+		{"zero players (host's player not made yet)", []byte{0, 0}, 1, false},
+		{"more players than max", []byte{9, 0}, 4, false},
+		{"locked not 0 or 1", []byte{2, 7}, 2, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer()
+			ctl, id := startHost(t, s, 4)
+			if err := writeFrame(ctl, UPDATE, tc.payload); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "UPDATE is applied", func() bool {
+				r, err := s.rooms.Get(id)
+				return err == nil && r.Players == tc.wantPlayers && r.Locked == tc.wantLocked
+			})
+			// Still open: a PONG goes through, and nothing comes back.
+			if err := writeFrame(ctl, PONG, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.rooms.Get(id); err != nil {
+				t.Error("the room is gone after a corrected UPDATE")
+			}
+		})
+	}
+}
+
 func TestControlBadFrameAfterHost(t *testing.T) {
 	tests := []struct {
 		name    string
 		typ     byte
 		payload []byte
 	}{
-		{"UPDATE locked not 0 or 1", UPDATE, []byte{1, 2}},
-		{"UPDATE more players than max", UPDATE, []byte{5, 0}},
-		{"UPDATE zero players", UPDATE, []byte{0, 0}},
 		{"UPDATE too short", UPDATE, []byte{1}},
+		{"UPDATE too long", UPDATE, []byte{1, 0, 0}},
 		{"frame type the relay sends", JOIN, nil},
 	}
 	for _, tc := range tests {
@@ -309,7 +395,7 @@ func TestControlBadFrameAfterHost(t *testing.T) {
 func TestJoin(t *testing.T) {
 	s := newTestServer()
 	ctl, room := startHost(t, s, 4)
-	hostData, joiner, code := pair(t, s, ctl, room)
+	hostData, joiner, code, _ := pair(t, s, ctl, room)
 
 	// Bytes go both ways, unchanged.
 	check := func(from, to net.Conn, msg string) {
@@ -349,6 +435,25 @@ func TestJoin(t *testing.T) {
 	}
 }
 
+// The joiner id: the same address gives the same id on one relay (so the host's per-address limits work), and a
+// relay with another key (a restart) gives a different one (so ids cannot be linked across runs).
+func TestJoinerID(t *testing.T) {
+	s := newTestServer()
+	ctl, room := startHost(t, s, 5)
+	_, _, _, first := pair(t, s, ctl, room)
+	_, _, _, second := pair(t, s, ctl, room) // also from 127.0.0.1, another port
+	if !bytes.Equal(first, second) {
+		t.Errorf("two joins from one address: ids % x and % x, want the same", first, second)
+	}
+
+	other := newTestServer()
+	ctl2, room2 := startHost(t, other, 5)
+	_, _, _, third := pair(t, other, ctl2, room2)
+	if bytes.Equal(first, third) {
+		t.Errorf("two relays (two keys) gave the same id % x", first)
+	}
+}
+
 // A game connection must not hit the 10 s header deadline from handle.
 func TestJoinNoDeadline(t *testing.T) {
 	if testing.Short() {
@@ -356,7 +461,7 @@ func TestJoinNoDeadline(t *testing.T) {
 	}
 	s := newTestServer()
 	ctl, room := startHost(t, s, 4)
-	hostData, joiner, _ := pair(t, s, ctl, room)
+	hostData, joiner, _, _ := pair(t, s, ctl, room)
 
 	time.Sleep(11 * time.Second)
 

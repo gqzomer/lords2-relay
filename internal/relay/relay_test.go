@@ -78,9 +78,9 @@ func TestWriteFrameTooLarge(t *testing.T) {
 
 // readFrame must reject len 0 and len > MaxFrameLength.
 func TestReadFrameBadLength(t *testing.T) {
-	for _, n := range []uint16{0, MaxFrameLength + 1} {
+	for _, n := range []uint32{0, MaxFrameLength + 1, 0xFFFFFFFF} {
 		client, server := tcpPair(t)
-		_, _ = client.Write(binary.LittleEndian.AppendUint16(nil, n))
+		_, _ = client.Write(binary.LittleEndian.AppendUint32(nil, n))
 		_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
 		if _, _, err := readFrame(server); err == nil {
 			t.Errorf("len %d: expected an error", n)

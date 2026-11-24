@@ -2,6 +2,10 @@
 //
 // The relay calls Create when a host sends HOST on its control connection, Update on UPDATE,
 // and Remove when the control connection closes (docs/protocol.md). The HTTP handler only reads.
+//
+// Create and Update never refuse a value: they bring it into range and return what they stored. A slightly wrong
+// value from dplayx.dll (0 players before the host's own player exists, a room size of 16) must not take the room
+// down; the relay compares the result with what it was sent and logs a warning when they differ.
 package lobby
 
 import (
@@ -9,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -19,14 +24,13 @@ const (
 	MinPlayers = 2
 	MaxPlayers = 5  // the game has five nobles
 	MaxNameLen = 32 // bytes, not characters: "é" is 2 bytes in UTF-8
+
+	DefaultName = "Lords2 game" // for a host that sends an empty name
 )
 
-// Errors the methods return. Callers compare with errors.Is(err, ErrNoRoom).
-// The relay turns them into the protocol's error codes (2 bad request, 3 no such room).
-var (
-	ErrBadRequest = errors.New("bad request")
-	ErrNoRoom     = errors.New("no such room")
-)
+// ErrNoRoom is returned for a room id that is not (or no longer) in the registry.
+// Callers compare with errors.Is(err, ErrNoRoom); the relay turns it into error code 3.
+var ErrNoRoom = errors.New("no such room")
 
 // Room is one open game. The json tags name the fields in the HTTP room list.
 type Room struct {
@@ -65,17 +69,9 @@ func (r *Registry) List(proto uint32) []Room {
 	return out
 }
 
-// Create adds a room for a new host and returns a copy of it.
-func (r *Registry) Create(name string, roomSize int, proto uint32) (Room, error) {
-
-	if len(name) == 0 || len(name) > MaxNameLen || !utf8.ValidString(name) {
-		return Room{}, ErrBadRequest
-	}
-
-	if roomSize < MinPlayers || roomSize > MaxPlayers {
-		return Room{}, ErrBadRequest
-	}
-
+// Create adds a room for a new host and returns a copy of it, with the name and size as stored (see CleanName and
+// ClampRoomSize).
+func (r *Registry) Create(name string, roomSize int, proto uint32) Room {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -89,9 +85,9 @@ func (r *Registry) Create(name string, roomSize int, proto uint32) (Room, error)
 
 	room := &Room{
 		ID:         id,
-		Name:       name,
+		Name:       CleanName(name),
 		Players:    1,
-		MaxPlayers: roomSize,
+		MaxPlayers: ClampRoomSize(roomSize),
 		Proto:      proto,
 		Locked:     false,
 		Created:    time.Now(),
@@ -99,28 +95,47 @@ func (r *Registry) Create(name string, roomSize int, proto uint32) (Room, error)
 
 	r.rooms[id] = room
 
-	return *room, nil
+	return *room
 }
 
-// Update sets the player count and the locked flag of a room.
-func (r *Registry) Update(id uint32, players int, locked bool) error {
+// CleanName makes any name fit the protocol: invalid UTF-8 becomes "?", spaces around it go, it is cut to
+// MaxNameLen bytes without splitting a character, and an empty name becomes DefaultName.
+func CleanName(name string) string {
+	name = strings.TrimSpace(strings.ToValidUTF8(name, "?"))
+	if len(name) > MaxNameLen {
+		cut := MaxNameLen
+		for cut > 0 && !utf8.RuneStart(name[cut]) { // step back to the first byte of a character
+			cut--
+		}
+		name = strings.TrimSpace(name[:cut])
+	}
+	if name == "" {
+		return DefaultName
+	}
+	return name
+}
+
+// ClampRoomSize brings a room size into MinPlayers..MaxPlayers.
+func ClampRoomSize(n int) int {
+	return min(max(n, MinPlayers), MaxPlayers)
+}
+
+// Update sets the player count and the locked flag of a room and returns a copy of it. players is brought into
+// 1..MaxPlayers of that room. The only error is ErrNoRoom.
+func (r *Registry) Update(id uint32, players int, locked bool) (Room, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	room := r.rooms[id]
 
 	if room == nil {
-		return ErrNoRoom
-	}
-
-	if players > room.MaxPlayers || players < 1 {
-		return ErrBadRequest
+		return Room{}, ErrNoRoom
 	}
 
 	room.Locked = locked
-	room.Players = players
+	room.Players = min(max(players, 1), room.MaxPlayers)
 
-	return nil
+	return *room, nil
 }
 
 // Remove deletes a room. Removing a room that is already gone is fine: the relay calls this

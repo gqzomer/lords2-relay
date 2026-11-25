@@ -15,7 +15,7 @@ func appendU8(b []byte, v uint8) []byte   { return append(b, v) }
 func appendU16(b []byte, v uint16) []byte { return binary.LittleEndian.AppendUint16(b, v) }
 func appendU32(b []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(b, v) }
 
-// appendStr appends a str. The caller keeps s at most 255 bytes; room names are at most 32.
+// appendStr appends a str. The caller keeps s at most 255 bytes; room names are at most lobby.MaxNameLen (64).
 func appendStr(b []byte, s string) []byte {
 	b = append(b, byte(len(s)))
 	return append(b, s...)

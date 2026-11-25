@@ -307,7 +307,7 @@ func TestControlHostCorrected(t *testing.T) {
 		wantMax  int
 	}{
 		{"empty name", hostPayload(4, ""), lobby.DefaultName, 4},
-		{"name too long", hostPayload(4, strings.Repeat("x", 40)), strings.Repeat("x", lobby.MaxNameLen), 4},
+		{"name too long", hostPayload(4, strings.Repeat("x", lobby.MaxNameLen+8)), strings.Repeat("x", lobby.MaxNameLen), 4},
 		{"max_players too high", hostPayload(16, "abc"), "abc", lobby.MaxPlayers},
 		{"max_players too low", hostPayload(1, "abc"), "abc", lobby.MinPlayers},
 	}

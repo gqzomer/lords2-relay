@@ -63,9 +63,11 @@ func TestCreateCorrects(t *testing.T) {
 		{"only spaces", "   ", 4, DefaultName, 4},
 		{"spaces around", "  game ", 4, "game", 4},
 		{"name too long", strings.Repeat("a", MaxNameLen+1), 4, strings.Repeat("a", MaxNameLen), 4},
-		// 17 characters, 34 bytes: cut to 16 whole characters (32 bytes), never half an "é"
-		{"name too long in bytes", strings.Repeat("é", 17), 4, strings.Repeat("é", 16), 4},
-		{"name too long, cut inside a character", "a" + strings.Repeat("é", 16), 4, "a" + strings.Repeat("é", 15), 4},
+		// "é" is 2 bytes: one character too many is cut to MaxNameLen/2 whole characters, never half an "é"
+		{"name too long in bytes", strings.Repeat("é", MaxNameLen/2+1), 4, strings.Repeat("é", MaxNameLen/2), 4},
+		{"name too long, cut inside a character", "a" + strings.Repeat("é", MaxNameLen/2), 4, "a" + strings.Repeat("é", MaxNameLen/2-1), 4},
+		// Jen's Mod Menu appends "|L2M1:" and 32 hex digits: the whole name must survive
+		{"name with a mod marker", "Lords2 Session1|L2M1:67d6eb0557e113b822e476e439cb0c28", 4, "Lords2 Session1|L2M1:67d6eb0557e113b822e476e439cb0c28", 4},
 		{"name not UTF-8", "game\xff", 4, "game?", 4},
 		{"one player", "game", 1, "game", MinPlayers},
 		{"six players", "game", 6, "game", MaxPlayers},

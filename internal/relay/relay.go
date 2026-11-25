@@ -43,7 +43,7 @@ const (
 	Version        = 1
 	HeaderSize     = 6
 	MaxRooms       = 20
-	MaxFrameLength = 1024 // len of a frame (type + payload), at most
+	MaxFrameLength = 2048 // len of a frame (type + payload), at most: ROOMS with 20 rooms of 64-byte names is ~1.5 KB
 	FrameLenSize   = 4    // len is a u32, as in dplayx.dll's own frames, so the DLL reuses its sendf / readf2
 )
 
@@ -280,7 +280,7 @@ func (s *Server) handleList(conn net.Conn, log *slog.Logger) {
 		}
 	}
 
-	b := make([]byte, 0, 1+len(rooms)*43) // a room takes at most 43 bytes
+	b := make([]byte, 0, 1+len(rooms)*(11+lobby.MaxNameLen)) // a room takes at most 11 + MaxNameLen bytes
 	b = append(b, byte(len(rooms)))
 	for _, room := range rooms {
 		b = appendU32(b, room.ID)

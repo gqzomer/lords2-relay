@@ -23,7 +23,8 @@ import (
 const (
 	MinPlayers = 2
 	MaxPlayers = 5  // the game has five nobles
-	MaxNameLen = 32 // bytes, not characters: "é" is 2 bytes in UTF-8
+	MaxNameLen = 64 // bytes, not characters: "é" is 2 bytes in UTF-8. dplayx.dll's own handshake carries 64, so a
+	// name that works by address works here too (Jen's Mod Menu appends a 38-byte version marker to the name)
 
 	DefaultName = "Lords2 game" // for a host that sends an empty name
 )

@@ -60,7 +60,7 @@ Control and list connections carry frames:
 | 5… | `payload` (`len - 1` bytes) |
 
 The same layout as dplayx.dll's own frames, so the DLL reads and writes them with its `sendf` / `readf2`. `len` is at
-most 1024. A frame type a side does not know is an error.
+most 2048. A frame type a side does not know is an error.
 
 ### Control (role 1)
 
@@ -80,13 +80,13 @@ most 1024. A frame type a side does not know is an error.
 4. When the control connection closes, for any reason, the room is removed. Game connections already paired keep running.
    There is no "close room" frame: the host simply closes the connection.
 
-Limits: `name` 1–32 bytes of UTF-8, `max_players` 2–5 (the game has five nobles), `players` 1–`max_players`,
+Limits: `name` 1–64 bytes of UTF-8, `max_players` 2–5 (the game has five nobles), `players` 1–`max_players`,
 `locked` 0 or 1. The relay **corrects** values outside these limits instead of refusing them, and logs a warning:
 
 | Value | Becomes |
 |---|---|
 | empty `name` (or only spaces) | `Lords2 game` (no warning: allowed) |
-| `name` over 32 bytes | cut to 32 bytes, never inside a character |
+| `name` over 64 bytes | cut to 64 bytes, never inside a character |
 | `name` not valid UTF-8 | each bad byte becomes `?` |
 | `max_players` outside 2–5 | 2 or 5 |
 | `players` outside 1–`max_players` | 1 or `max_players` (e.g. 0 before the host's own player exists) |
